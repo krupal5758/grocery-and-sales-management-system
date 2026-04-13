@@ -1,0 +1,30 @@
+{
+  "name": "grocery-sales-management",
+  "version": "1.0.0",
+  "description": "Grocery and sales management system built with AngularJS, Express, and SQLite",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.3",
+    "sqlite3": "^5.1.7"
+  },
+  "keywords": [
+    "grocery",
+    "inventory",
+    "sales",
+    "angularjs",
+    "express",
+    "sqlite"
+  ],
+  "author": "Krupal",
+  "license": "MIT"
+}
