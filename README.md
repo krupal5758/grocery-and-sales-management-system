@@ -38,9 +38,25 @@ Start the server:
 npm start
 ```
 
+Run the test suite:
+
+```bash
+npm test
+```
+
 Open `http://localhost:3000` in your browser.
 
-Default login: `admin` / `admin123`
+### First login
+
+There is **no default password**. On first run, register an account at the
+sign-up screen — the **first user to register is automatically made an admin**.
+
+Alternatively, set `ADMIN_PASSWORD` in your `.env` before the first start to
+seed an `admin` user with that password.
+
+> **Production:** `JWT_SECRET` must be set or the server will refuse to start.
+> Generate one with:
+> `node -e "console.log(require('crypto').randomBytes(48).toString('hex'))"`
 
 ## Project structure
 

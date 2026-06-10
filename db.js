@@ -1,7 +1,7 @@
 const path = require("path");
 const sqlite3 = require("sqlite3").verbose();
 
-const dbPath = path.join(__dirname, "data.db");
+const dbPath = process.env.DB_PATH || path.join(__dirname, "data.db");
 const db = new sqlite3.Database(dbPath);
 
 function init() {
@@ -58,6 +58,7 @@ function init() {
         total REAL NOT NULL,
         payment_mode TEXT NOT NULL,
         customer_name TEXT,
+        customer_id INTEGER REFERENCES customers(id),
         sold_at TEXT NOT NULL
       )`
     );
@@ -167,6 +168,17 @@ function init() {
       )`
     );
 
+    // ── Counters table (atomic invoice/PO/return numbering) ──────────────
+    // One row per number prefix (e.g. 'INV-20260610-'). Incremented with a
+    // single upsert statement so concurrent requests can never read the same
+    // value — unlike the old COUNT(*)+1 approach which raced.
+    db.run(
+      `CREATE TABLE IF NOT EXISTS counters (
+        name TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
+      )`
+    );
+
     // ── Indexes for performance ───────────────────────────────────────────
     db.run(`CREATE INDEX IF NOT EXISTS idx_sales_product_id ON sales(product_id)`);
     db.run(`CREATE INDEX IF NOT EXISTS idx_sales_sold_at ON sales(sold_at)`);
@@ -188,15 +200,23 @@ function init() {
     db.run(`ALTER TABLE audit_log ADD COLUMN user_id INTEGER REFERENCES users(id)`, function (err) {});
     db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)`);
 
-    // ── Seed default admin user (password: admin123) ──────────────────────
-    const bcrypt = require("bcryptjs");
-    const adminHash = bcrypt.hashSync("admin123", 10);
-    const now = new Date().toISOString();
-    db.run(
-      `INSERT OR IGNORE INTO users (username, email, password_hash, role, full_name, is_active, created_at)
-       VALUES ('admin', 'admin@store.com', ?, 'admin', 'Administrator', 1, ?)`,
-      [adminHash, now]
-    );
+    // ── Seed default admin user ───────────────────────────────────────────
+    // Only seed an admin when ADMIN_PASSWORD is explicitly provided. Shipping a
+    // known default password (e.g. "admin123") means every fresh install is
+    // compromised out of the box. When no password is set, no admin is created
+    // and the first user to register is auto-promoted to admin (see
+    // POST /api/auth/register), giving a secure first-run bootstrap.
+    const adminPassword = process.env.ADMIN_PASSWORD;
+    if (adminPassword) {
+      const bcrypt = require("bcryptjs");
+      const adminHash = bcrypt.hashSync(adminPassword, 10);
+      const now = new Date().toISOString();
+      db.run(
+        `INSERT OR IGNORE INTO users (username, email, password_hash, role, full_name, is_active, created_at)
+         VALUES ('admin', 'admin@store.com', ?, 'admin', 'Administrator', 1, ?)`,
+        [adminHash, now]
+      );
+    }
   });
 }
 
