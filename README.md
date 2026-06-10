@@ -38,6 +38,12 @@ Start the server:
 npm start
 ```
 
+Run the test suite:
+
+```bash
+npm test
+```
+
 Open `http://localhost:3000` in your browser.
 
 ### First login

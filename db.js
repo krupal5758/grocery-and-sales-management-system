@@ -1,7 +1,7 @@
 const path = require("path");
 const sqlite3 = require("sqlite3").verbose();
 
-const dbPath = path.join(__dirname, "data.db");
+const dbPath = process.env.DB_PATH || path.join(__dirname, "data.db");
 const db = new sqlite3.Database(dbPath);
 
 function init() {
@@ -165,6 +165,17 @@ function init() {
         expense_date TEXT NOT NULL,
         created_by INTEGER REFERENCES users(id),
         created_at TEXT NOT NULL
+      )`
+    );
+
+    // ── Counters table (atomic invoice/PO/return numbering) ──────────────
+    // One row per number prefix (e.g. 'INV-20260610-'). Incremented with a
+    // single upsert statement so concurrent requests can never read the same
+    // value — unlike the old COUNT(*)+1 approach which raced.
+    db.run(
+      `CREATE TABLE IF NOT EXISTS counters (
+        name TEXT PRIMARY KEY,
+        value INTEGER NOT NULL
       )`
     );
 

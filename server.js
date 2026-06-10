@@ -3,7 +3,17 @@ const path = require("path");
 const fs = require("fs");
 const cookieParser = require("cookie-parser");
 const { db, init } = require("./db");
-const { requireString, requireNonNegativeNumber, requirePositiveInt, ValidationError } = require("./validate");
+const {
+  requireString,
+  optionalString,
+  requireNonNegativeNumber,
+  requirePositiveInt,
+  requireEmail,
+  optionalEmail,
+  optionalPhone,
+  requireOneOf,
+  ValidationError,
+} = require("./validate");
 const { hashPassword, verifyPassword, generateToken, authenticate, authorize } = require("./auth");
 
 const app = express();
@@ -37,10 +47,10 @@ app.get("/api/health", (req, res) => {
 
 app.post("/api/auth/register", (req, res) => {
   try {
-    const username = requireString(req.body && req.body.username, "Username");
-    const email = requireString(req.body && req.body.email, "Email");
+    const username = requireString(req.body && req.body.username, "Username", 50);
+    const email = requireEmail(req.body && req.body.email, "Email");
     const password = requireString(req.body && req.body.password, "Password");
-    const fullName = requireString(req.body && req.body.fullName, "Full name");
+    const fullName = requireString(req.body && req.body.fullName, "Full name", 100);
     const role = (req.body && req.body.role) || "cashier";
 
     if (!["admin", "manager", "cashier"].includes(role)) {
@@ -188,6 +198,12 @@ app.put("/api/users/:id", authenticate, authorize("admin"), (req, res) => {
   // Prevent admin from demoting themselves
   if (id === req.user.id && role && role !== "admin") {
     return res.status(400).json({ error: "Cannot change your own role" });
+  }
+
+  // Prevent admin from deactivating themselves — if they're the only admin,
+  // that would lock everyone out of admin functions permanently.
+  if (id === req.user.id && isActive !== undefined && !isActive) {
+    return res.status(400).json({ error: "Cannot deactivate your own account" });
   }
 
   db.run(
@@ -342,8 +358,8 @@ app.put("/api/products/:id/stock", authenticate, (req, res) => {
 app.get("/api/products/low-stock", authenticate, (req, res) => {
   db.all(
     `SELECT p.id, p.name, p.category, p.unit, p.unit_price as unitPrice, p.stock_qty as stockQty
-     FROM products p, settings s
-     WHERE s.id = 1 AND p.stock_qty <= s.low_stock_threshold
+     FROM products p
+     WHERE p.stock_qty <= COALESCE((SELECT low_stock_threshold FROM settings WHERE id = 1), 5)
      ORDER BY p.stock_qty ASC`,
     [],
     (err, rows) => {
@@ -458,8 +474,12 @@ app.post("/api/sales", authenticate, (req, res) => {
     const qty = requirePositiveInt(req.body && req.body.qty, "Quantity");
     const safeDiscount = requireNonNegativeNumber((req.body && req.body.discount) || 0, "Discount");
     const safeGst = requireNonNegativeNumber((req.body && req.body.gstPercent) || 0, "GST");
-    const paymentMode = (req.body && req.body.paymentMode) || "Cash";
-    const customerName = (req.body && req.body.customerName) || "";
+    const paymentMode = requireOneOf(
+      (req.body && req.body.paymentMode) || "Cash",
+      ["Cash", "UPI", "Card", "Credit"],
+      "Payment mode"
+    );
+    const customerName = optionalString(req.body && req.body.customerName, "Customer name");
     const customerId = (req.body && req.body.customerId) || null;
 
     db.get(
@@ -477,73 +497,79 @@ app.post("/api/sales", authenticate, (req, res) => {
         const total = roundMoney(taxableTotal + gstAmount);
         const soldAt = new Date().toISOString();
 
-        generateInvoiceNo((invoiceErr, invoiceNo) => {
-          if (invoiceErr) return res.status(500).json({ error: "Failed to generate invoice number" });
+        withTxLock((done) => {
+          const fail = (status, message) =>
+            db.run("ROLLBACK", () => { done(); res.status(status).json({ error: message }); });
 
-          db.run("BEGIN TRANSACTION", (beginErr) => {
-            if (beginErr) return res.status(500).json({ error: "DB error" });
+          generateInvoiceNo((invoiceErr, invoiceNo) => {
+            if (invoiceErr) { done(); return res.status(500).json({ error: "Failed to generate invoice number" }); }
 
-            const now = new Date().toISOString();
-            db.run(
-              `UPDATE products SET stock_qty = stock_qty - ?, updated_at = ? WHERE id = ?`,
-              [qty, now, productId],
-              (updateErr) => {
-                if (updateErr) {
-                  return db.run("ROLLBACK", () => res.status(500).json({ error: "DB error" }));
-                }
+            db.run("BEGIN TRANSACTION", (beginErr) => {
+              if (beginErr) { done(); return res.status(500).json({ error: "DB error" }); }
 
-                db.run(
-                  `INSERT INTO sales
-                   (invoice_no, product_id, product_name, unit, qty, unit_price, gross_total, discount,
-                    taxable_total, gst_percent, gst_amount, total, payment_mode, customer_name, customer_id, sold_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                  [invoiceNo, productId, product.name, product.unit, qty, product.unitPrice,
-                   grossTotal, discountApplied, taxableTotal, safeGst, gstAmount, total,
-                   paymentMode, customerName, customerId, soldAt],
-                  function (insertErr) {
-                    if (insertErr) {
-                      return db.run("ROLLBACK", () => res.status(500).json({ error: "DB error" }));
-                    }
+              const now = new Date().toISOString();
+              // Guard in SQL too: the stockQty check above ran outside the
+              // transaction, so a concurrent sale may have shrunk stock since.
+              db.run(
+                `UPDATE products SET stock_qty = stock_qty - ?, updated_at = ? WHERE id = ? AND stock_qty >= ?`,
+                [qty, now, productId, qty],
+                function (updateErr) {
+                  if (updateErr) return fail(500, "DB error");
+                  if (this.changes === 0) return fail(400, "Insufficient stock");
 
-                    const saleId = this.lastID;
+                  db.run(
+                    `INSERT INTO sales
+                     (invoice_no, product_id, product_name, unit, qty, unit_price, gross_total, discount,
+                      taxable_total, gst_percent, gst_amount, total, payment_mode, customer_name, customer_id, sold_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [invoiceNo, productId, product.name, product.unit, qty, product.unitPrice,
+                     grossTotal, discountApplied, taxableTotal, safeGst, gstAmount, total,
+                     paymentMode, customerName, customerId, soldAt],
+                    function (insertErr) {
+                      if (insertErr) return fail(500, "DB error");
 
-                    // Update customer stats if customerId provided
-                    const afterSale = () => {
-                      db.run("COMMIT", (commitErr) => {
-                        if (commitErr) {
-                          return db.run("ROLLBACK", () => res.status(500).json({ error: "DB error" }));
-                        }
+                      const saleId = this.lastID;
 
-                        logAudit("sale", "sale", saleId, `Invoice ${invoiceNo} — ${product.name} x${qty} = ₹${total}`, req.user.id);
+                      // Update customer stats if customerId provided
+                      const afterSale = () => {
+                        db.run("COMMIT", (commitErr) => {
+                          if (commitErr) return fail(500, "DB error");
+                          done();
 
-                        // Async: check low stock and send email if configured
-                        checkLowStockAlert(productId);
+                          logAudit("sale", "sale", saleId, `Invoice ${invoiceNo} — ${product.name} x${qty} = ₹${total}`, req.user.id);
 
-                        res.status(201).json({
-                          sale: {
-                            id: saleId, invoiceNo, productId, productName: product.name,
-                            unit: product.unit, qty, unitPrice: product.unitPrice,
-                            grossTotal, discount: discountApplied, taxableTotal,
-                            gstPercent: safeGst, gstAmount, total, paymentMode, customerName, customerId, soldAt
-                          },
-                          product: { id: productId, stockQty: product.stockQty - qty }
+                          // Async: check low stock and send email if configured
+                          checkLowStockAlert(productId);
+
+                          res.status(201).json({
+                            sale: {
+                              id: saleId, invoiceNo, productId, productName: product.name,
+                              unit: product.unit, qty, unitPrice: product.unitPrice,
+                              grossTotal, discount: discountApplied, taxableTotal,
+                              gstPercent: safeGst, gstAmount, total, paymentMode, customerName, customerId, soldAt
+                            },
+                            product: { id: productId, stockQty: product.stockQty - qty }
+                          });
                         });
-                      });
-                    };
+                      };
 
-                    if (customerId) {
-                      db.run(
-                        `UPDATE customers SET total_purchases = total_purchases + ?, visit_count = visit_count + 1 WHERE id = ?`,
-                        [total, customerId],
-                        () => afterSale()
-                      );
-                    } else {
-                      afterSale();
+                      if (customerId) {
+                        db.run(
+                          `UPDATE customers SET total_purchases = total_purchases + ?, visit_count = visit_count + 1 WHERE id = ?`,
+                          [total, customerId],
+                          (custErr) => {
+                            if (custErr) return fail(500, "DB error");
+                            afterSale();
+                          }
+                        );
+                      } else {
+                        afterSale();
+                      }
                     }
-                  }
-                );
-              }
-            );
+                  );
+                }
+              );
+            });
           });
         });
       }
@@ -578,10 +604,10 @@ app.get("/api/customers", authenticate, (req, res) => {
 
 app.post("/api/customers", authenticate, (req, res) => {
   try {
-    const name = requireString(req.body && req.body.name, "Name");
-    const phone = (req.body && req.body.phone) || null;
-    const email = (req.body && req.body.email) || null;
-    const address = (req.body && req.body.address) || null;
+    const name = requireString(req.body && req.body.name, "Name", 100);
+    const phone = optionalPhone(req.body && req.body.phone, "Phone");
+    const email = optionalEmail(req.body && req.body.email, "Email");
+    const address = optionalString(req.body && req.body.address, "Address", 300) || null;
     const now = new Date().toISOString();
 
     db.run(
@@ -607,10 +633,10 @@ app.put("/api/customers/:id", authenticate, (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ error: "Invalid id" });
-    const name = requireString(req.body && req.body.name, "Name");
-    const phone = (req.body && req.body.phone) || null;
-    const email = (req.body && req.body.email) || null;
-    const address = (req.body && req.body.address) || null;
+    const name = requireString(req.body && req.body.name, "Name", 100);
+    const phone = optionalPhone(req.body && req.body.phone, "Phone");
+    const email = optionalEmail(req.body && req.body.email, "Email");
+    const address = optionalString(req.body && req.body.address, "Address", 300) || null;
 
     db.run(
       `UPDATE customers SET name = ?, phone = ?, email = ?, address = ? WHERE id = ?`,
@@ -677,12 +703,12 @@ app.get("/api/suppliers", authenticate, (req, res) => {
 
 app.post("/api/suppliers", authenticate, authorize("admin", "manager"), (req, res) => {
   try {
-    const name = requireString(req.body && req.body.name, "Name");
-    const contactPerson = (req.body && req.body.contactPerson) || "";
-    const phone = (req.body && req.body.phone) || "";
-    const email = (req.body && req.body.email) || "";
-    const address = (req.body && req.body.address) || "";
-    const gstNumber = (req.body && req.body.gstNumber) || "";
+    const name = requireString(req.body && req.body.name, "Name", 100);
+    const contactPerson = optionalString(req.body && req.body.contactPerson, "Contact person", 100);
+    const phone = optionalPhone(req.body && req.body.phone, "Phone") || "";
+    const email = optionalEmail(req.body && req.body.email, "Email") || "";
+    const address = optionalString(req.body && req.body.address, "Address", 300);
+    const gstNumber = optionalString(req.body && req.body.gstNumber, "GST number", 30);
     const now = new Date().toISOString();
 
     db.run(
@@ -708,12 +734,12 @@ app.put("/api/suppliers/:id", authenticate, authorize("admin", "manager"), (req,
   try {
     const id = Number(req.params.id);
     if (!id) return res.status(400).json({ error: "Invalid id" });
-    const name = requireString(req.body && req.body.name, "Name");
-    const contactPerson = (req.body && req.body.contactPerson) || "";
-    const phone = (req.body && req.body.phone) || "";
-    const email = (req.body && req.body.email) || "";
-    const address = (req.body && req.body.address) || "";
-    const gstNumber = (req.body && req.body.gstNumber) || "";
+    const name = requireString(req.body && req.body.name, "Name", 100);
+    const contactPerson = optionalString(req.body && req.body.contactPerson, "Contact person", 100);
+    const phone = optionalPhone(req.body && req.body.phone, "Phone") || "";
+    const email = optionalEmail(req.body && req.body.email, "Email") || "";
+    const address = optionalString(req.body && req.body.address, "Address", 300);
+    const gstNumber = optionalString(req.body && req.body.gstNumber, "GST number", 30);
     const isActive = req.body && req.body.isActive !== undefined ? (req.body.isActive ? 1 : 0) : 1;
 
     db.run(
@@ -816,31 +842,41 @@ app.put("/api/purchase-orders/:id/receive", authenticate, authorize("admin", "ma
     if (po.status !== "pending") return res.status(400).json({ error: "PO is already " + po.status });
 
     const now = new Date().toISOString();
-    db.run("BEGIN TRANSACTION", (beginErr) => {
-      if (beginErr) return res.status(500).json({ error: "DB error" });
+    withTxLock((done) => {
+      const fail = () =>
+        db.run("ROLLBACK", () => { done(); res.status(500).json({ error: "DB error" }); });
 
-      db.run(
-        `UPDATE purchase_orders SET status = 'received', received_at = ? WHERE id = ?`,
-        [now, id],
-        (err2) => {
-          if (err2) return db.run("ROLLBACK", () => res.status(500).json({ error: "DB error" }));
+      db.run("BEGIN TRANSACTION", (beginErr) => {
+        if (beginErr) { done(); return res.status(500).json({ error: "DB error" }); }
 
-          // Auto-update product stock and cost price
-          db.run(
-            `UPDATE products SET stock_qty = stock_qty + ?, cost_price = ?, updated_at = ? WHERE id = ?`,
-            [po.qty, po.unit_cost, now, po.product_id],
-            (err3) => {
-              if (err3) return db.run("ROLLBACK", () => res.status(500).json({ error: "DB error" }));
-
-              db.run("COMMIT", (commitErr) => {
-                if (commitErr) return db.run("ROLLBACK", () => res.status(500).json({ error: "DB error" }));
-                logAudit("receive", "purchase_order", id, `PO #${po.po_number} received — stock +${po.qty}`, req.user.id);
-                res.json({ ok: true });
-              });
+        // Re-check status inside the transaction; the earlier check raced.
+        db.run(
+          `UPDATE purchase_orders SET status = 'received', received_at = ? WHERE id = ? AND status = 'pending'`,
+          [now, id],
+          function (err2) {
+            if (err2) return fail();
+            if (this.changes === 0) {
+              return db.run("ROLLBACK", () => { done(); res.status(400).json({ error: "PO is no longer pending" }); });
             }
-          );
-        }
-      );
+
+            // Auto-update product stock and cost price
+            db.run(
+              `UPDATE products SET stock_qty = stock_qty + ?, cost_price = ?, updated_at = ? WHERE id = ?`,
+              [po.qty, po.unit_cost, now, po.product_id],
+              (err3) => {
+                if (err3) return fail();
+
+                db.run("COMMIT", (commitErr) => {
+                  if (commitErr) return fail();
+                  done();
+                  logAudit("receive", "purchase_order", id, `PO #${po.po_number} received — stock +${po.qty}`, req.user.id);
+                  res.json({ ok: true });
+                });
+              }
+            );
+          }
+        );
+      });
     });
   });
 });
@@ -916,38 +952,48 @@ app.post("/api/returns", authenticate, (req, res) => {
               return res.status(400).json({ error: `Cannot return ${qty} items. Already returned ${alreadyReturned} of ${sale.saleQty}` });
             }
 
-            const refundAmount = roundMoney(sale.unit_price * qty);
+            // Refund the actual per-unit amount paid (total includes discount
+            // and GST) — not the list unit_price, which would refund more than
+            // the customer paid on discounted sales and less on taxed ones.
+            const refundAmount = roundMoney((sale.total / sale.saleQty) * qty);
             const now = new Date().toISOString();
 
-            generateReturnNo((retErr, returnNo) => {
-              if (retErr) return res.status(500).json({ error: "Failed to generate return number" });
+            withTxLock((done) => {
+              const fail = () =>
+                db.run("ROLLBACK", () => { done(); res.status(500).json({ error: "DB error" }); });
 
-              db.run("BEGIN TRANSACTION", (beginErr) => {
-                if (beginErr) return res.status(500).json({ error: "DB error" });
+              generateReturnNo((retErr, returnNo) => {
+                if (retErr) { done(); return res.status(500).json({ error: "Failed to generate return number" }); }
 
-                // Restore stock
-                db.run(
-                  `UPDATE products SET stock_qty = stock_qty + ?, updated_at = ? WHERE id = ?`,
-                  [qty, now, sale.product_id],
-                  (err3) => {
-                    if (err3) return db.run("ROLLBACK", () => res.status(500).json({ error: "DB error" }));
+                db.run("BEGIN TRANSACTION", (beginErr) => {
+                  if (beginErr) { done(); return res.status(500).json({ error: "DB error" }); }
 
-                    db.run(
-                      `INSERT INTO returns (return_no, sale_id, product_id, qty, refund_amount, reason, processed_by, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                      [returnNo, saleId, sale.product_id, qty, refundAmount, reason, req.user.id, now],
-                      function (err4) {
-                        if (err4) return db.run("ROLLBACK", () => res.status(500).json({ error: "DB error" }));
+                  // Restore stock
+                  db.run(
+                    `UPDATE products SET stock_qty = stock_qty + ?, updated_at = ? WHERE id = ?`,
+                    [qty, now, sale.product_id],
+                    (err3) => {
+                      if (err3) return fail();
 
-                        db.run("COMMIT", (commitErr) => {
-                          if (commitErr) return db.run("ROLLBACK", () => res.status(500).json({ error: "DB error" }));
-                          logAudit("return", "return", this.lastID, `Return ${returnNo} — ${sale.product_name} x${qty}, refund ₹${refundAmount}`, req.user.id);
-                          res.status(201).json({ id: this.lastID, returnNo, saleId, productId: sale.product_id, qty, refundAmount, reason, createdAt: now });
-                        });
-                      }
-                    );
-                  }
-                );
+                      db.run(
+                        `INSERT INTO returns (return_no, sale_id, product_id, qty, refund_amount, reason, processed_by, created_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [returnNo, saleId, sale.product_id, qty, refundAmount, reason, req.user.id, now],
+                        function (err4) {
+                          if (err4) return fail();
+                          const returnId = this.lastID;
+
+                          db.run("COMMIT", (commitErr) => {
+                            if (commitErr) return fail();
+                            done();
+                            logAudit("return", "return", returnId, `Return ${returnNo} — ${sale.product_name} x${qty}, refund ₹${refundAmount}`, req.user.id);
+                            res.status(201).json({ id: returnId, returnNo, saleId, productId: sale.product_id, qty, refundAmount, reason, createdAt: now });
+                          });
+                        }
+                      );
+                    }
+                  );
+                });
               });
             });
           }
@@ -998,10 +1044,14 @@ app.get("/api/expenses", authenticate, (req, res) => {
 
 app.post("/api/expenses", authenticate, authorize("admin", "manager"), (req, res) => {
   try {
-    const category = requireString(req.body && req.body.category, "Category");
-    const description = (req.body && req.body.description) || "";
+    const category = requireString(req.body && req.body.category, "Category", 100);
+    const description = optionalString(req.body && req.body.description, "Description", 500);
     const amount = requireNonNegativeNumber(req.body && req.body.amount, "Amount");
-    const paymentMode = (req.body && req.body.paymentMode) || "Cash";
+    const paymentMode = requireOneOf(
+      (req.body && req.body.paymentMode) || "Cash",
+      ["Cash", "UPI", "Bank Transfer", "Cheque"],
+      "Payment mode"
+    );
     const expenseDate = (req.body && req.body.expenseDate) || new Date().toISOString().split("T")[0];
     const now = new Date().toISOString();
 
@@ -1361,6 +1411,8 @@ app.post("/api/import", authenticate, authorize("admin"), (req, res) => {
   const products = Array.isArray(payload.products) ? payload.products : [];
   const sales = Array.isArray(payload.sales) ? payload.sales : [];
   const settings = payload.settings || {};
+  let skippedProducts = 0;
+  let skippedSales = 0;
 
   db.serialize(() => {
     db.run("DELETE FROM returns");
@@ -1376,9 +1428,16 @@ app.post("/api/import", authenticate, authorize("admin"), (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
     products.forEach((p) => {
-      if (!p || !p.name) return;
-      stmt.run(p.name, p.category || "General", p.unit || "pcs",
-               p.unitPrice || 0, p.stockQty || 0,
+      // Skip records with missing names or non-numeric/negative amounts
+      // instead of silently importing garbage data.
+      if (!p || typeof p.name !== "string" || !p.name.trim()) return void skippedProducts++;
+      const unitPrice = Number(p.unitPrice || 0);
+      const stockQty = Number(p.stockQty || 0);
+      if (Number.isNaN(unitPrice) || unitPrice < 0 || Number.isNaN(stockQty) || stockQty < 0) {
+        return void skippedProducts++;
+      }
+      stmt.run(p.name.trim(), p.category || "General", p.unit || "pcs",
+               unitPrice, stockQty,
                p.createdAt || new Date().toISOString(),
                p.createdAt || new Date().toISOString());
     });
@@ -1391,7 +1450,12 @@ app.post("/api/import", authenticate, authorize("admin"), (req, res) => {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     sales.forEach((s, idx) => {
-      if (!s || !s.productName || !s.qty) return;
+      if (!s || typeof s.productName !== "string" || !s.productName.trim()) return void skippedSales++;
+      const saleQty = Number(s.qty);
+      const saleTotal = Number(s.total || 0);
+      if (!Number.isInteger(saleQty) || saleQty <= 0 || Number.isNaN(saleTotal) || saleTotal < 0) {
+        return void skippedSales++;
+      }
       salesStmt.run(
         s.invoiceNo || `INV-${invoiceDateTag(s.soldAt || new Date())}-${String(idx + 1).padStart(4, "0")}`,
         s.productId || 0, s.productName, s.unit || "pcs", s.qty || 0,
@@ -1415,7 +1479,7 @@ app.post("/api/import", authenticate, authorize("admin"), (req, res) => {
   });
 
   logAudit("import", "system", null, `Imported ${products.length} products, ${sales.length} sales`, req.user.id);
-  res.json({ ok: true });
+  res.json({ ok: true, skipped: { products: skippedProducts, sales: skippedSales } });
 });
 
 app.delete("/api/clear", authenticate, authorize("admin"), (req, res) => {
@@ -1484,8 +1548,11 @@ app.post("/api/backups", authenticate, authorize("admin"), (req, res) => {
               if (err6) return res.status(500).json({ error: "DB error" });
               payload.settings = settings;
 
+              // Random suffix prevents two backups created in the same
+              // millisecond from overwriting each other.
               const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-              const filename = `backup-${timestamp}.json`;
+              const suffix = Math.random().toString(36).slice(2, 8);
+              const filename = `backup-${timestamp}-${suffix}.json`;
               fs.writeFileSync(path.join(BACKUP_DIR, filename), JSON.stringify(payload, null, 2));
 
               // Keep only last 7 backups
@@ -1551,43 +1618,62 @@ function roundMoney(value) {
   return Math.round((Number(value || 0) + Number.EPSILON) * 100) / 100;
 }
 
-function generateInvoiceNo(callback) {
-  const tag = invoiceDateTag(new Date());
+// All queries share a single SQLite connection, so statements from concurrent
+// requests interleave. If two requests both issue BEGIN TRANSACTION, the second
+// fails ("cannot start a transaction within a transaction") and other writes
+// can silently join a foreign transaction and be rolled back with it. This
+// mutex serializes the BEGIN→COMMIT/ROLLBACK critical sections: fn receives a
+// `done` callback that MUST be called exactly once on every exit path.
+let txLock = Promise.resolve();
+function withTxLock(fn) {
+  let release;
+  const next = new Promise((r) => { release = r; });
+  const acquired = txLock;
+  txLock = txLock.then(() => next);
+  acquired.then(() => fn(release));
+}
+
+// Sequence numbers (invoice/PO/return) come from the counters table via a
+// single atomic upsert — two concurrent requests can never get the same
+// number. The previous COUNT(*)+1 approach read then wrote in separate
+// steps, producing duplicate invoice numbers under concurrent load.
+// On first use of a prefix the counter is seeded from the highest existing
+// number, so databases created before the counters table keep numbering
+// where they left off.
+const SEQUENCE_SOURCES = {
+  INV: { table: "sales", column: "invoice_no" },
+  PO: { table: "purchase_orders", column: "po_number" },
+  RET: { table: "returns", column: "return_no" },
+};
+
+function nextSequenceNumber(kind, callback) {
+  const { table, column } = SEQUENCE_SOURCES[kind];
+  const prefix = `${kind}-${invoiceDateTag(new Date())}-`;
   db.get(
-    `SELECT COUNT(*) + 1 as next FROM sales WHERE invoice_no LIKE ?`,
-    [`INV-${tag}-%`],
+    `INSERT INTO counters (name, value)
+     VALUES (?, COALESCE(
+       (SELECT MAX(CAST(substr(${column}, length(?) + 1) AS INTEGER)) FROM ${table} WHERE ${column} LIKE ? || '%'),
+       0) + 1)
+     ON CONFLICT(name) DO UPDATE SET value = value + 1
+     RETURNING value`,
+    [prefix, prefix, prefix],
     (err, row) => {
-      if (err) return callback(err);
-      const counter = String(row ? row.next : 1).padStart(4, "0");
-      callback(null, `INV-${tag}-${counter}`);
+      if (err || !row) return callback(err || new Error("Counter returned no value"));
+      callback(null, `${prefix}${String(row.value).padStart(4, "0")}`);
     }
   );
+}
+
+function generateInvoiceNo(callback) {
+  nextSequenceNumber("INV", callback);
 }
 
 function generatePONumber(callback) {
-  const tag = invoiceDateTag(new Date());
-  db.get(
-    `SELECT COUNT(*) + 1 as next FROM purchase_orders WHERE po_number LIKE ?`,
-    [`PO-${tag}-%`],
-    (err, row) => {
-      if (err) return callback(err);
-      const counter = String(row ? row.next : 1).padStart(4, "0");
-      callback(null, `PO-${tag}-${counter}`);
-    }
-  );
+  nextSequenceNumber("PO", callback);
 }
 
 function generateReturnNo(callback) {
-  const tag = invoiceDateTag(new Date());
-  db.get(
-    `SELECT COUNT(*) + 1 as next FROM returns WHERE return_no LIKE ?`,
-    [`RET-${tag}-%`],
-    (err, row) => {
-      if (err) return callback(err);
-      const counter = String(row ? row.next : 1).padStart(4, "0");
-      callback(null, `RET-${tag}-${counter}`);
-    }
-  );
+  nextSequenceNumber("RET", callback);
 }
 
 function invoiceDateTag(dateValue) {
