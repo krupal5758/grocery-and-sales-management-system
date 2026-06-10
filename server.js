@@ -1410,11 +1410,26 @@ app.post("/api/import", authenticate, authorize("admin"), (req, res) => {
   const payload = req.body || {};
   const products = Array.isArray(payload.products) ? payload.products : [];
   const sales = Array.isArray(payload.sales) ? payload.sales : [];
+  const customers = Array.isArray(payload.customers) ? payload.customers : [];
   const settings = payload.settings || {};
   let skippedProducts = 0;
   let skippedSales = 0;
+  let skippedCustomers = 0;
+
+  // Track which parent ids actually made it in. Foreign keys are enforced
+  // (PRAGMA foreign_keys = ON) and sales reference products(id)/customers(id),
+  // so we must insert parents first (preserving their ids) and skip any sale
+  // whose parent is missing rather than letting the FK silently drop it.
+  const importedProductIds = new Set();
+  const importedCustomerIds = new Set();
 
   db.serialize(() => {
+    // Wrap the whole restore in a transaction so we can (a) respond only after
+    // the writes are durably committed — otherwise the 200 races ahead of the
+    // queued inserts and clients read stale data — and (b) roll back on error.
+    // Parents are inserted before children, so the (immediate) FK checks pass
+    // without disabling enforcement.
+    db.run("BEGIN TRANSACTION");
     db.run("DELETE FROM returns");
     db.run("DELETE FROM sales");
     db.run("DELETE FROM purchase_orders");
@@ -1423,9 +1438,30 @@ app.post("/api/import", authenticate, authorize("admin"), (req, res) => {
     db.run("DELETE FROM customers");
     db.run("DELETE FROM suppliers");
 
+    // Customers first — parents of sales.customer_id. Preserve the original id.
+    // (Export uses SELECT *, so fields are snake_case; accept camelCase too.)
+    const custStmt = db.prepare(
+      `INSERT INTO customers (id, name, phone, email, address, total_purchases, visit_count, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    customers.forEach((c) => {
+      if (!c || typeof c.name !== "string" || !c.name.trim() || c.id == null) return void skippedCustomers++;
+      custStmt.run(
+        c.id, c.name.trim(), c.phone || null, c.email || null, c.address || null,
+        Number(c.total_purchases ?? c.totalPurchases) || 0,
+        Number(c.visit_count ?? c.visitCount) || 0,
+        c.created_at || c.createdAt || new Date().toISOString()
+      );
+      importedCustomerIds.add(Number(c.id));
+    });
+    custStmt.finalize();
+
+    // Products — parents of sales.product_id. Preserve the original id so sale
+    // references resolve. supplier_id is left null (suppliers aren't restored
+    // by this format) to avoid a dangling FK.
     const stmt = db.prepare(
-      `INSERT INTO products (name, category, unit, unit_price, stock_qty, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO products (id, name, category, unit, unit_price, stock_qty, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
     );
     products.forEach((p) => {
       // Skip records with missing names or non-numeric/negative amounts
@@ -1436,18 +1472,20 @@ app.post("/api/import", authenticate, authorize("admin"), (req, res) => {
       if (Number.isNaN(unitPrice) || unitPrice < 0 || Number.isNaN(stockQty) || stockQty < 0) {
         return void skippedProducts++;
       }
-      stmt.run(p.name.trim(), p.category || "General", p.unit || "pcs",
+      const productId = p.id != null ? Number(p.id) : null;
+      stmt.run(productId, p.name.trim(), p.category || "General", p.unit || "pcs",
                unitPrice, stockQty,
                p.createdAt || new Date().toISOString(),
                p.createdAt || new Date().toISOString());
+      if (productId != null) importedProductIds.add(productId);
     });
     stmt.finalize();
 
     const salesStmt = db.prepare(
       `INSERT INTO sales
        (invoice_no, product_id, product_name, unit, qty, unit_price, gross_total, discount,
-        taxable_total, gst_percent, gst_amount, total, payment_mode, customer_name, sold_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        taxable_total, gst_percent, gst_amount, total, payment_mode, customer_name, customer_id, sold_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
     sales.forEach((s, idx) => {
       if (!s || typeof s.productName !== "string" || !s.productName.trim()) return void skippedSales++;
@@ -1456,13 +1494,24 @@ app.post("/api/import", authenticate, authorize("admin"), (req, res) => {
       if (!Number.isInteger(saleQty) || saleQty <= 0 || Number.isNaN(saleTotal) || saleTotal < 0) {
         return void skippedSales++;
       }
+      // product_id is NOT NULL with an enforced FK — skip the sale if its
+      // product wasn't imported rather than triggering a silent FK drop.
+      const productId = Number(s.productId);
+      if (!importedProductIds.has(productId)) return void skippedSales++;
+      // Keep customer_id only if that customer was imported; otherwise null so
+      // the sale is preserved without violating the FK.
+      const customerId =
+        s.customerId != null && importedCustomerIds.has(Number(s.customerId)) ? Number(s.customerId) : null;
+
+      // Insert the coerced numbers (not the raw values, which may be numeric
+      // strings) and preserve customer_id so export→import round-trips cleanly.
       salesStmt.run(
         s.invoiceNo || `INV-${invoiceDateTag(s.soldAt || new Date())}-${String(idx + 1).padStart(4, "0")}`,
-        s.productId || 0, s.productName, s.unit || "pcs", s.qty || 0,
-        s.unitPrice || 0, s.grossTotal || 0, s.discount || 0,
-        s.taxableTotal || 0, s.gstPercent || 0, s.gstAmount || 0,
-        s.total || 0, s.paymentMode || "Cash", s.customerName || "",
-        s.soldAt || new Date().toISOString()
+        productId, s.productName, s.unit || "pcs", saleQty,
+        Number(s.unitPrice) || 0, Number(s.grossTotal) || 0, Number(s.discount) || 0,
+        Number(s.taxableTotal) || 0, Number(s.gstPercent) || 0, Number(s.gstAmount) || 0,
+        saleTotal, s.paymentMode || "Cash", s.customerName || "",
+        customerId, s.soldAt || new Date().toISOString()
       );
     });
     salesStmt.finalize();
@@ -1476,10 +1525,26 @@ app.post("/api/import", authenticate, authorize("admin"), (req, res) => {
         Number(settings.lowStockThreshold || 5)
       ]
     );
-  });
 
-  logAudit("import", "system", null, `Imported ${products.length} products, ${sales.length} sales`, req.user.id);
-  res.json({ ok: true, skipped: { products: skippedProducts, sales: skippedSales } });
+    db.run("COMMIT", (commitErr) => {
+      if (commitErr) {
+        return db.run("ROLLBACK", () => res.status(500).json({ error: "Import failed" }));
+      }
+
+      const importedProducts = products.length - skippedProducts;
+      const importedSales = sales.length - skippedSales;
+      const importedCustomers = customers.length - skippedCustomers;
+      logAudit("import", "system", null,
+        `Imported ${importedProducts} products, ${importedCustomers} customers, ${importedSales} sales ` +
+        `(skipped ${skippedProducts} products, ${skippedCustomers} customers, ${skippedSales} sales)`,
+        req.user.id);
+      res.json({
+        ok: true,
+        imported: { products: importedProducts, customers: importedCustomers, sales: importedSales },
+        skipped: { products: skippedProducts, customers: skippedCustomers, sales: skippedSales },
+      });
+    });
+  });
 });
 
 app.delete("/api/clear", authenticate, authorize("admin"), (req, res) => {
@@ -1630,7 +1695,19 @@ function withTxLock(fn) {
   const next = new Promise((r) => { release = r; });
   const acquired = txLock;
   txLock = txLock.then(() => next);
-  acquired.then(() => fn(release));
+  acquired.then(() => {
+    // `done` is idempotent and the handler is wrapped: if fn throws
+    // synchronously before calling done(), the lock is still released so the
+    // write path can't deadlock permanently.
+    let released = false;
+    const done = () => { if (!released) { released = true; release(); } };
+    try {
+      fn(done);
+    } catch (e) {
+      console.error(`[txLock] handler threw before releasing: ${e.message}`);
+      done();
+    }
+  });
 }
 
 // Sequence numbers (invoice/PO/return) come from the counters table via a

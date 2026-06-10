@@ -266,3 +266,46 @@ test("purchase order receive updates stock and PO numbers are well-formed", asyn
   const updated = products.find((p) => p.id === product.id);
   assert.strictEqual(updated.stockQty, 15);
 });
+
+// Destructive (wipes all data via import), so it runs last.
+test("import restores customers, preserves ids, coerces numbers, and reports accurate counts", async () => {
+  const payload = {
+    customers: [
+      { id: 7, name: "Imported Cust", phone: "9000000007", total_purchases: 400, visit_count: 1, created_at: new Date().toISOString() },
+      { id: 8, name: "", phone: "9000000008" }, // skipped: no name
+    ],
+    products: [
+      { id: 3, name: "Imported Tea", category: "Beverages", unit: "kg", unitPrice: "200", stockQty: "10" },
+      { name: "", unitPrice: 5, stockQty: 5 },           // skipped: no name
+      { name: "Bad Price", unitPrice: -1, stockQty: 5 }, // skipped: negative
+    ],
+    sales: [
+      // numeric strings + a customer_id and product_id that must round-trip
+      { invoiceNo: "INV-IMPORT-0001", productId: 3, productName: "Imported Tea", unit: "kg", qty: "2", total: "400", customerId: 7, customerName: "Imported Cust", paymentMode: "UPI" },
+      { productName: "No Qty", productId: 3, qty: 0, total: 10 },        // skipped: qty 0
+      { invoiceNo: "INV-IMPORT-0002", productId: 999, productName: "Ghost", qty: 1, total: 5 }, // skipped: product 999 not imported
+    ],
+    settings: { storeName: "Imported Store", gstPercent: 12, lowStockThreshold: 3 },
+  };
+
+  const res = await api("POST", "/api/import", {
+    token: adminToken,
+    headers: { "x-confirm": "yes" },
+    body: payload,
+  });
+  assert.strictEqual(res.status, 200);
+  const result = await res.json();
+  assert.deepStrictEqual(result.imported, { products: 1, customers: 1, sales: 1 });
+  assert.deepStrictEqual(result.skipped, { products: 2, customers: 1, sales: 2 });
+
+  // The customer row itself is restored (with its original id)...
+  const customers = await (await api("GET", "/api/customers", { token: adminToken })).json();
+  assert.ok(customers.some((c) => c.id === 7 && c.name === "Imported Cust"), "customer 7 should be restored");
+
+  // ...and the sale is linked to it with coerced numeric fields.
+  const history = await (await api("GET", "/api/customers/7/history", { token: adminToken })).json();
+  const imported = history.find((h) => h.invoiceNo === "INV-IMPORT-0001");
+  assert.ok(imported, "imported sale should be linked to customer 7");
+  assert.strictEqual(imported.qty, 2, "qty should be coerced to a number");
+  assert.strictEqual(imported.total, 400, "total should be coerced to a number");
+});
