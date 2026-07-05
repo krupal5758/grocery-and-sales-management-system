@@ -1,7 +1,19 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const crypto = require("crypto");
 
-const SECRET = process.env.JWT_SECRET || "grocery-store-jwt-secret-key-2024";
+// Without JWT_SECRET set, fall back to a random per-boot secret rather than a
+// committed constant: sessions won't survive a restart, but tokens can't be
+// forged by anyone reading this file.
+const SECRET =
+  process.env.JWT_SECRET ||
+  (() => {
+    console.warn(
+      "[auth] JWT_SECRET is not set — using a random secret for this boot only. " +
+        "All sessions will be invalidated on restart. Set JWT_SECRET in the environment."
+    );
+    return crypto.randomBytes(32).toString("hex");
+  })();
 const TOKEN_EXPIRY = "8h";
 
 // ── Password helpers ──────────────────────────────────────────────────────────

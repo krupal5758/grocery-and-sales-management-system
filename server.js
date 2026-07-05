@@ -130,7 +130,12 @@ app.post("/api/auth/login", (req, res) => {
 
         logAudit("login", "user", user.id, `User "${username}" logged in`, user.id);
 
-        res.cookie("token", token, { httpOnly: true, maxAge: 8 * 60 * 60 * 1000 });
+        res.cookie("token", token, {
+          httpOnly: true,
+          sameSite: "lax",
+          secure: process.env.NODE_ENV === "production",
+          maxAge: 8 * 60 * 60 * 1000,
+        });
         res.json({
           token,
           user: { id: user.id, username: user.username, email: user.email, role: user.role, fullName: user.fullName }
