@@ -1544,9 +1544,14 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Internal server error" });
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// Only listen when run directly — tests import the app via supertest.
+if (require.main === module) {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+}
+
+module.exports = app;
 
 // ══════════════════════════════════════════════════════════════════════════════
 // ── HELPERS ──────────────────────────────────────────────────────────────────

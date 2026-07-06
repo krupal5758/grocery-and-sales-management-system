@@ -1,7 +1,8 @@
 const path = require("path");
 const sqlite3 = require("sqlite3").verbose();
 
-const dbPath = path.join(__dirname, "data.db");
+// DB_PATH override lets tests run against a throwaway database (":memory:" or a temp file)
+const dbPath = process.env.DB_PATH || path.join(__dirname, "data.db");
 const db = new sqlite3.Database(dbPath);
 
 function init() {
@@ -188,15 +189,9 @@ function init() {
     db.run(`ALTER TABLE audit_log ADD COLUMN user_id INTEGER REFERENCES users(id)`, function (err) {});
     db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)`);
 
-    // ── Seed default admin user (password: admin123) ──────────────────────
-    const bcrypt = require("bcryptjs");
-    const adminHash = bcrypt.hashSync("admin123", 10);
-    const now = new Date().toISOString();
-    db.run(
-      `INSERT OR IGNORE INTO users (username, email, password_hash, role, full_name, is_active, created_at)
-       VALUES ('admin', 'admin@store.com', ?, 'admin', 'Administrator', 1, ?)`,
-      [adminHash, now]
-    );
+    // No seeded default admin: a well-known admin/admin123 account in a public
+    // repo is a standing takeover risk. Bootstrap instead via the register
+    // endpoint — the first registered user automatically becomes admin.
   });
 }
 

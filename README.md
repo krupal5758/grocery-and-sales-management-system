@@ -40,7 +40,14 @@ npm start
 
 Open `http://localhost:3000` in your browser.
 
-Default login: `admin` / `admin123`
+The first account you register automatically becomes the admin; admins can
+then register staff (manager/cashier) from within the app.
+
+Run the test suite:
+
+```bash
+npm test
+```
 
 ## Project structure
 
