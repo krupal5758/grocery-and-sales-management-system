@@ -62,16 +62,27 @@ function authenticate(req, res, next) {
     return res.status(401).json({ error: "Authentication required" });
   }
 
+  let decoded;
   try {
-    const decoded = verifyToken(token);
-    req.user = { id: decoded.id, username: decoded.username, role: decoded.role };
-    next();
+    decoded = verifyToken(token);
   } catch (err) {
     if (err.name === "TokenExpiredError") {
       return res.status(401).json({ error: "Token expired, please login again" });
     }
     return res.status(401).json({ error: "Invalid token" });
   }
+
+  // Re-check role and active status from the DB so deactivating or demoting a
+  // user takes effect immediately, not when their 8h token expires.
+  const { db } = require("./db");
+  db.get(`SELECT role, is_active FROM users WHERE id = ?`, [decoded.id], (err, row) => {
+    if (err) return res.status(500).json({ error: "DB error" });
+    if (!row || !row.is_active) {
+      return res.status(403).json({ error: "Account is deactivated" });
+    }
+    req.user = { id: decoded.id, username: decoded.username, role: row.role };
+    next();
+  });
 }
 
 // ── Middleware: authorize ─────────────────────────────────────────────────────
